@@ -18,7 +18,7 @@ use core::{mem::size_of, ptr::NonNull};
 ///
 /// ```
 /// use aarch64_paging::{
-///     descriptor::{Attributes, PhysicalAddress},
+///     descriptor::{PhysicalAddress, Stage1Attributes},
 ///     paging::{Constraints, MemoryRegion, RootTable, TranslationRegime, VaRange},
 ///     target::TargetAllocator,
 /// };
@@ -34,10 +34,10 @@ use core::{mem::size_of, ptr::NonNull};
 /// map.map_range(
 ///     &MemoryRegion::new(0x0, 0x1000),
 ///     PhysicalAddress(0x4_2000),
-///     Attributes::VALID
-///         | Attributes::ATTRIBUTE_INDEX_0
-///         | Attributes::INNER_SHAREABLE
-///         | Attributes::UXN,
+///     Stage1Attributes::VALID
+///         | Stage1Attributes::ATTRIBUTE_INDEX_0
+///         | Stage1Attributes::INNER_SHAREABLE
+///         | Stage1Attributes::UXN,
 ///     Constraints::empty(),
 /// )
 /// .unwrap();
@@ -137,7 +137,7 @@ impl Translation for TargetAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::descriptor::Attributes;
+    use crate::descriptor::Stage1Attributes;
     use crate::paging::{Constraints, MemoryRegion, RootTable, TranslationRegime, VaRange};
 
     const ROOT_LEVEL: usize = 1;
@@ -153,10 +153,10 @@ mod tests {
         map.map_range(
             &MemoryRegion::new(0x0, 0x1000),
             PhysicalAddress(0x4_2000),
-            Attributes::VALID
-                | Attributes::ATTRIBUTE_INDEX_0
-                | Attributes::INNER_SHAREABLE
-                | Attributes::UXN,
+            Stage1Attributes::VALID
+                | Stage1Attributes::ATTRIBUTE_INDEX_0
+                | Stage1Attributes::INNER_SHAREABLE
+                | Stage1Attributes::UXN,
             Constraints::empty(),
         )
         .unwrap();

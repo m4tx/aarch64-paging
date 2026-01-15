@@ -19,20 +19,20 @@
 //! # #[cfg(feature = "alloc")] {
 //! use aarch64_paging::{
 //!     idmap::IdMap,
-//!     descriptor::Attributes,
+//!     descriptor::Stage1Attributes,
 //!     paging::{MemoryRegion, TranslationRegime},
 //! };
 //!
 //! const ASID: usize = 1;
 //! const ROOT_LEVEL: usize = 1;
-//! const NORMAL_CACHEABLE: Attributes = Attributes::ATTRIBUTE_INDEX_1.union(Attributes::INNER_SHAREABLE);
+//! const NORMAL_CACHEABLE: Stage1Attributes = Stage1Attributes::ATTRIBUTE_INDEX_1.union(Stage1Attributes::INNER_SHAREABLE);
 //!
 //! // Create a new EL1 page table with identity mapping.
 //! let mut idmap = IdMap::new(ASID, ROOT_LEVEL, TranslationRegime::El1And0);
 //! // Map a 2 MiB region of memory as read-write.
 //! idmap.map_range(
 //!     &MemoryRegion::new(0x80200000, 0x80400000),
-//!     NORMAL_CACHEABLE | Attributes::NON_GLOBAL | Attributes::VALID | Attributes::ACCESSED,
+//!     NORMAL_CACHEABLE | Stage1Attributes::NON_GLOBAL | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
 //! ).unwrap();
 //! // SAFETY: Everything the program uses is within the 2 MiB region mapped above.
 //! unsafe {
@@ -63,7 +63,8 @@ extern crate alloc;
 use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use descriptor::{
-    Attributes, Descriptor, DescriptorBits, PhysicalAddress, UpdatableDescriptor, VirtualAddress,
+    Descriptor, DescriptorBits, PagingAttributes, PhysicalAddress, Stage1Attributes,
+    UpdatableDescriptor, VirtualAddress,
 };
 use paging::{Constraints, MemoryRegion, RootTable, Translation, TranslationRegime, VaRange};
 use thiserror::Error;
@@ -85,8 +86,8 @@ pub enum MapError {
     #[error("Error updating page table entry {0:?}")]
     PteUpdateFault(DescriptorBits),
     /// The requested flags are not supported for this mapping
-    #[error("Flags {0:?} unsupported for mapping.")]
-    InvalidFlags(Attributes),
+    #[error("Flags {0:#x} unsupported for mapping.")]
+    InvalidFlags(usize),
     /// Updating the range violates break-before-make rules and the mapping is live
     #[error("Cannot remap region {0} while translation is live.")]
     BreakBeforeMakeViolation(MemoryRegion),
@@ -100,8 +101,8 @@ pub enum MapError {
 /// switch back to a previous static page table, and then `activate` again after making the desired
 /// changes.
 #[derive(Debug)]
-pub struct Mapping<T: Translation> {
-    root: RootTable<T>,
+pub struct Mapping<T: Translation<A>, A: PagingAttributes = Stage1Attributes> {
+    root: RootTable<T, A>,
     asid: usize,
     active_count: AtomicUsize,
 }
@@ -117,7 +118,7 @@ fn wait_for_tlb_maintenance() {
     }
 }
 
-impl<T: Translation> Mapping<T> {
+impl<T: Translation<A>, A: PagingAttributes> Mapping<T, A> {
     /// Creates a new page table with the given ASID, root level and translation mapping.
     pub fn new(
         translation: T,
@@ -230,6 +231,14 @@ impl<T: Translation> Mapping<T> {
                     previous_ttbr = out(reg) previous_ttbr,
                     options(preserves_flags),
                 ),
+                (TranslationRegime::Stage2, VaRange::Lower) => asm!(
+                    "mrs   {previous_ttbr}, vttbr_el2",
+                    "msr   vttbr_el2, {ttbrval}",
+                    "isb",
+                    ttbrval = in(reg) self.root_address().0 | (self.asid << 48),
+                    previous_ttbr = out(reg) previous_ttbr,
+                    options(preserves_flags),
+                ),
                 _ => {
                     panic!("Invalid combination of exception level and VA range.");
                 }
@@ -302,6 +311,17 @@ impl<T: Translation> Mapping<T> {
                 (TranslationRegime::El3, VaRange::Lower) => {
                     panic!("EL3 page table can't safety be deactivated.");
                 }
+                (TranslationRegime::Stage2, VaRange::Lower) => asm!(
+                    // For Stage 2, we invalidate using the current VTTBR (which has our VMID),
+                    // then restore the previous VTTBR.
+                    "tlbi  vmalls12e1",
+                    "dsb   nsh",
+                    "isb",
+                    "msr   vttbr_el2, {ttbrval}",
+                    "isb",
+                    ttbrval = in(reg) previous_ttbr,
+                    options(preserves_flags),
+                ),
                 _ => {
                     panic!("Invalid combination of exception level and VA range.");
                 }
@@ -314,11 +334,11 @@ impl<T: Translation> Mapping<T> {
     /// without violating architectural break-before-make (BBM) requirements.
     fn check_range_bbm<F>(&self, range: &MemoryRegion, updater: &F) -> Result<(), MapError>
     where
-        F: Fn(&MemoryRegion, &mut UpdatableDescriptor) -> Result<(), ()> + ?Sized,
+        F: Fn(&MemoryRegion, &mut UpdatableDescriptor<A>) -> Result<(), ()> + ?Sized,
     {
         self.root.visit_range(
             range,
-            &mut |mr: &MemoryRegion, d: &Descriptor, level: usize| {
+            &mut |mr: &MemoryRegion, d: &Descriptor<A>, level: usize| {
                 let err = MapError::BreakBeforeMakeViolation(mr.clone());
                 let mut desc = UpdatableDescriptor::clone_from(d, level);
 
@@ -348,9 +368,13 @@ impl<T: Translation> Mapping<T> {
             // deactivated, at which point TLB invalidation would have occurred, and so no TLB
             // maintenance is needed.
             self.root
-                .visit_range(range, &mut |mr: &MemoryRegion, _: &Descriptor, _: usize| {
-                    Ok(self.root.translation_regime().invalidate_va(mr.start()))
-                })
+                .visit_range(
+                    range,
+                    &mut |mr: &MemoryRegion, _: &Descriptor<A>, _: usize| {
+                        self.root.translation_regime().invalidate_va(mr.start());
+                        Ok(())
+                    },
+                )
                 .unwrap();
 
             wait_for_tlb_maintenance();
@@ -360,14 +384,14 @@ impl<T: Translation> Mapping<T> {
     /// Maps the given range of virtual addresses to the corresponding range of physical addresses
     /// starting at `pa`, with the given flags, taking the given constraints into account.
     ///
-    /// To unmap a range, pass `flags` which don't contain the `Attributes::VALID` bit. In this case
-    /// the `pa` is ignored.
+    /// To unmap a range, pass `flags` which don't contain the [`PagingAttributes::VALID`] bit.
+    /// In this case the `pa` is ignored.
     ///
     /// This should generally only be called while the page table is not active. In particular, any
     /// change that may require break-before-make per the architecture must be made while the page
     /// table is inactive. Mapping a previously unmapped memory range may be done while the page
     /// table is active. This function writes block and page entries, but only maps them if `flags`
-    /// contains `Attributes::VALID`, otherwise the entries remain invalid.
+    /// contains [`PagingAttributes::VALID`], otherwise the entries remain invalid.
     ///
     /// # Errors
     ///
@@ -384,15 +408,15 @@ impl<T: Translation> Mapping<T> {
         &mut self,
         range: &MemoryRegion,
         pa: PhysicalAddress,
-        flags: Attributes,
+        flags: A,
         constraints: Constraints,
     ) -> Result<(), MapError> {
         if self.active() {
-            let c = |mr: &MemoryRegion, d: &mut UpdatableDescriptor| {
+            let c = |mr: &MemoryRegion, d: &mut UpdatableDescriptor<A>| {
                 let mask = !(paging::granularity_at_level(d.level()) - 1);
                 let pa = (mr.start() - range.start() + pa.0) & mask;
                 let flags = if d.level() == 3 {
-                    flags | Attributes::TABLE_OR_PAGE
+                    flags | A::TABLE_OR_PAGE
                 } else {
                     flags
                 };
@@ -443,7 +467,7 @@ impl<T: Translation> Mapping<T> {
     /// and modifying those would violate architectural break-before-make (BBM) requirements.
     pub fn modify_range<F>(&mut self, range: &MemoryRegion, f: &F) -> Result<(), MapError>
     where
-        F: Fn(&MemoryRegion, &mut UpdatableDescriptor) -> Result<(), ()> + ?Sized,
+        F: Fn(&MemoryRegion, &mut UpdatableDescriptor<A>) -> Result<(), ()> + ?Sized,
     {
         if self.active() {
             self.check_range_bbm(range, f)?;
@@ -475,7 +499,7 @@ impl<T: Translation> Mapping<T> {
     /// largest virtual address covered by the page table given its root level.
     pub fn walk_range<F>(&self, range: &MemoryRegion, f: &mut F) -> Result<(), MapError>
     where
-        F: FnMut(&MemoryRegion, &Descriptor, usize) -> Result<(), ()>,
+        F: FnMut(&MemoryRegion, &Descriptor<A>, usize) -> Result<(), ()>,
     {
         self.root.walk_range(range, f)
     }
@@ -531,7 +555,7 @@ impl<T: Translation> Mapping<T> {
     }
 }
 
-impl<T: Translation> Drop for Mapping<T> {
+impl<T: Translation<A>, A: PagingAttributes> Drop for Mapping<T, A> {
     fn drop(&mut self) {
         if self.active() {
             panic!("Dropping active page table mapping!");
@@ -550,13 +574,25 @@ mod tests {
     #[test]
     #[should_panic]
     fn no_el2_asid() {
-        Mapping::new(IdTranslation, 1, 1, TranslationRegime::El2, VaRange::Lower);
+        Mapping::<IdTranslation, Stage1Attributes>::new(
+            IdTranslation::new(),
+            1,
+            1,
+            TranslationRegime::El2,
+            VaRange::Lower,
+        );
     }
 
     #[cfg(feature = "alloc")]
     #[test]
     #[should_panic]
     fn no_el3_asid() {
-        Mapping::new(IdTranslation, 1, 1, TranslationRegime::El3, VaRange::Lower);
+        Mapping::<IdTranslation, Stage1Attributes>::new(
+            IdTranslation::new(),
+            1,
+            1,
+            TranslationRegime::El3,
+            VaRange::Lower,
+        );
     }
 }

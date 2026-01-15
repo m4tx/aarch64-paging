@@ -12,7 +12,8 @@ use crate::paging::PageTableWithLevel;
 
 use bitflags::bitflags;
 use core::fmt::{self, Debug, Display, Formatter};
-use core::ops::{Add, Sub};
+use core::marker::PhantomData;
+use core::ops::{Add, BitAnd, BitOr, BitXor, Not, Sub};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// An aarch64 virtual address, the input type of a stage 1 page table.
@@ -98,10 +99,60 @@ impl Sub<usize> for PhysicalAddress {
     }
 }
 
+/// Trait abstracting the attributes used in page table descriptors.
+///
+/// This allows the same page table structure to be used for different translation regimes (e.g.
+/// Stage 1 vs Stage 2) which use different attribute bit definitions.
+pub trait PagingAttributes:
+    Sized
+    + Copy
+    + Clone
+    + Debug
+    + PartialEq
+    + Default
+    + Send
+    + Sync
+    + PartialOrd
+    + BitOr<Output = Self>
+    + BitAnd<Output = Self>
+    + BitXor<Output = Self>
+    + Sub<Output = Self>
+    + Not<Output = Self>
+{
+    /// Create attributes from raw bits, preserving unknown bits.
+    fn from_bits_retain(bits: usize) -> Self;
+    /// Get the raw bits of the attributes.
+    fn bits(&self) -> usize;
+    /// Returns true if all flags in `other` are contained in `self`.
+    fn contains(&self, other: Self) -> bool {
+        (*self & other) == other
+    }
+    /// Returns the union of the two sets of flags.
+    fn union(&self, other: Self) -> Self {
+        *self | other
+    }
+    /// Returns the difference between the two sets of flags.
+    fn difference(&self, other: Self) -> Self {
+        *self - other
+    }
+    /// Returns true if the set of flags is empty.
+    fn is_empty(&self) -> bool;
+    /// Returns true if the two sets of flags intersect.
+    fn intersects(&self, other: Self) -> bool;
+
+    /// The bit indicating that a mapping is valid.
+    const VALID: Self;
+    /// The bit indicating that a descriptor is a table or page (leaf at level 3) rather than a block.
+    const TABLE_OR_PAGE: Self;
+
+    /// Returns true if it is architecturally safe to update from `old` to `new` without break-before-make.
+    fn is_bbm_safe(old: Self, new: Self) -> bool;
+}
+
 bitflags! {
-    /// Attribute bits for a mapping in a page table.
+    /// Attribute bits for a mapping in a Stage 1 page table.
     #[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-    pub struct Attributes: usize {
+    pub struct Stage1Attributes: usize {
         const VALID         = 1 << 0;
         const TABLE_OR_PAGE = 1 << 1;
 
@@ -145,12 +196,117 @@ bitflags! {
     }
 }
 
-impl Attributes {
+impl PagingAttributes for Stage1Attributes {
+    fn from_bits_retain(bits: usize) -> Self {
+        Self::from_bits_retain(bits)
+    }
+    fn bits(&self) -> usize {
+        self.bits()
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+    fn intersects(&self, other: Self) -> bool {
+        self.intersects(other)
+    }
+
+    const VALID: Self = Self::VALID;
+    const TABLE_OR_PAGE: Self = Self::TABLE_OR_PAGE;
+
+    fn is_bbm_safe(old: Self, new: Self) -> bool {
+        if !old.contains(Self::VALID) || !new.contains(Self::VALID) {
+            return true;
+        }
+
+        // Masks of bits that may be set resp. cleared on a live, valid mapping without BBM
+        let clear_allowed_mask = Self::VALID
+            | Self::READ_ONLY
+            | Self::ACCESSED
+            | Self::DBM
+            | Self::PXN
+            | Self::UXN
+            | Self::SWFLAG_0
+            | Self::SWFLAG_1
+            | Self::SWFLAG_2
+            | Self::SWFLAG_3;
+        let set_allowed_mask = clear_allowed_mask | Self::NON_GLOBAL;
+
+        (!old & new & !set_allowed_mask).is_empty() && (old & !new & !clear_allowed_mask).is_empty()
+    }
+}
+
+#[deprecated(note = "use `Stage1Attributes` directly instead")]
+pub type Attributes = Stage1Attributes;
+
+impl Stage1Attributes {
     /// Mask for the bits determining the shareability of the mapping.
     pub const SHAREABILITY_MASK: Self = Self::INNER_SHAREABLE;
 
     /// Mask for the bits determining the attribute index of the mapping.
     pub const ATTRIBUTE_INDEX_MASK: Self = Self::ATTRIBUTE_INDEX_7;
+}
+
+bitflags! {
+    /// Attribute bits for a mapping in a Stage 2 page table.
+    #[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    pub struct Stage2Attributes: usize {
+        const VALID         = 1 << 0;
+        const TABLE_OR_PAGE = 1 << 1;
+
+        const MEMATTR_DEVICE_nGnRnE = 0 << 2;
+        const MEMATTR_NORMAL        = 0xf << 2; // Example value
+
+        // S2AP[1:0] at [7:6]
+        const S2AP_ACCESS_NONE = 0 << 6;
+        const S2AP_ACCESS_RO   = 1 << 6;
+        const S2AP_ACCESS_WO   = 2 << 6;
+        const S2AP_ACCESS_RW   = 3 << 6;
+
+        const SH_NONE          = 0 << 8;
+        const SH_OUTER         = 2 << 8;
+        const SH_INNER         = 3 << 8;
+
+        const ACCESS_FLAG      = 1 << 10;
+
+        const XN               = 1 << 54;
+
+        const SWFLAG_0 = 1 << 55;
+        const SWFLAG_1 = 1 << 56;
+        const SWFLAG_2 = 1 << 57;
+        const SWFLAG_3 = 1 << 58;
+    }
+}
+
+impl PagingAttributes for Stage2Attributes {
+    fn from_bits_retain(bits: usize) -> Self {
+        Self::from_bits_retain(bits)
+    }
+    fn bits(&self) -> usize {
+        self.bits()
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+    fn intersects(&self, other: Self) -> bool {
+        self.intersects(other)
+    }
+
+    const VALID: Self = Self::VALID;
+    const TABLE_OR_PAGE: Self = Self::TABLE_OR_PAGE;
+
+    fn is_bbm_safe(old: Self, new: Self) -> bool {
+        // Changing memory type (MemAttr, SH) is unsafe.
+        const MEM_ATTR_MASK: usize = 0b1111 << 2;
+        const SH_MASK: usize = 0b11 << 8;
+
+        let old_bits = old.bits();
+        let new_bits = new.bits();
+
+        if (old_bits ^ new_bits) & (MEM_ATTR_MASK | SH_MASK) != 0 {
+            return false;
+        }
+        true
+    }
 }
 
 pub(crate) type DescriptorBits = usize;
@@ -163,13 +319,20 @@ pub(crate) type DescriptorBits = usize;
 ///   - A block mapping, if it is not in the lowest level page table.
 ///   - A pointer to a lower level pagetable, if it is not in the lowest level page table.
 #[repr(C)]
-pub struct Descriptor(pub(crate) AtomicUsize);
+pub struct Descriptor<A: PagingAttributes = Stage1Attributes>(
+    pub(crate) AtomicUsize,
+    PhantomData<A>,
+);
 
-impl Descriptor {
+impl<A: PagingAttributes> Descriptor<A> {
     /// An empty (i.e. 0) descriptor.
-    pub const EMPTY: Self = Self(AtomicUsize::new(0));
+    pub const EMPTY: Self = Self(AtomicUsize::new(0), PhantomData);
 
     const PHYSICAL_ADDRESS_BITMASK: usize = !(PAGE_SIZE - 1) & !(0xffff << 48);
+
+    pub(crate) fn new(value: usize) -> Self {
+        Descriptor(AtomicUsize::new(value), PhantomData)
+    }
 
     /// Returns the contents of a descriptor which may be potentially live
     /// Use acquire semantics so that the load is not reordered with subsequent loads
@@ -189,39 +352,38 @@ impl Descriptor {
         PhysicalAddress(bits & Self::PHYSICAL_ADDRESS_BITMASK)
     }
 
-    fn flags_from_bits(bits: DescriptorBits) -> Attributes {
-        Attributes::from_bits_retain(bits & !Self::PHYSICAL_ADDRESS_BITMASK)
+    fn flags_from_bits(bits: DescriptorBits) -> A {
+        A::from_bits_retain(bits & !Self::PHYSICAL_ADDRESS_BITMASK)
     }
 
     /// Returns the flags of this page table entry, or `None` if its state does not
     /// contain a valid set of flags.
-    pub fn flags(&self) -> Attributes {
+    pub fn flags(&self) -> A {
         Self::flags_from_bits(self.bits())
     }
 
-    /// Returns `true` if [`Attributes::VALID`] is set on this entry, e.g. if the entry is mapped.
+    /// Returns `true` if [`PagingAttributes::VALID`] is set on this entry, e.g. if the entry is mapped.
     pub fn is_valid(&self) -> bool {
-        (self.bits() & Attributes::VALID.bits()) != 0
+        (self.bits() & A::VALID.bits()) != 0
     }
 
     /// Returns `true` if this is a valid entry pointing to a next level translation table or a page.
     pub fn is_table_or_page(&self) -> bool {
-        self.flags()
-            .contains(Attributes::TABLE_OR_PAGE | Attributes::VALID)
+        self.flags().contains(A::TABLE_OR_PAGE | A::VALID)
     }
 
-    pub(crate) fn set(&mut self, pa: PhysicalAddress, flags: Attributes) {
+    pub(crate) fn set(&mut self, pa: PhysicalAddress, flags: A) {
         self.0.store(
             (pa.0 & Self::PHYSICAL_ADDRESS_BITMASK) | flags.bits(),
             Ordering::Release,
         );
     }
 
-    pub(crate) fn subtable<T: Translation>(
+    pub(crate) fn subtable<T: Translation<A>>(
         &self,
         translation: &T,
         level: usize,
-    ) -> Option<PageTableWithLevel<T>> {
+    ) -> Option<PageTableWithLevel<T, A>> {
         if level < LEAF_LEVEL && self.is_table_or_page() {
             let output_address = self.output_address();
             let table = translation.physical_to_virtual(output_address);
@@ -231,7 +393,7 @@ impl Descriptor {
     }
 }
 
-impl Debug for Descriptor {
+impl<A: PagingAttributes> Debug for Descriptor<A> {
     fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
         write!(f, "{:#016x}", self.bits())?;
         if self.is_valid() {
@@ -241,47 +403,47 @@ impl Debug for Descriptor {
     }
 }
 
-enum DescriptorEnum<'a> {
+enum DescriptorEnum<'a, A: PagingAttributes> {
     /// A descriptor that is part of a set of page tables that are currently in use by one of the
     /// CPUs
-    Active(&'a mut Descriptor),
+    Active(&'a mut Descriptor<A>),
 
     /// A descriptor that is part of a set of page tables that are currently inactive. This means
     /// TLB maintenance may be elided until the next time the page tables are made active.
-    Inactive(&'a mut Descriptor),
+    Inactive(&'a mut Descriptor<A>),
 
     /// A descriptor that does not actually represent an entry in a page table. It permits updaters
     /// taking an UpdatableDescriptor to be called for a dry run to observe their effect without
     /// the need to pass an actual descriptor.
-    ActiveClone(DescriptorBits),
+    ActiveClone(DescriptorBits, PhantomData<A>),
 }
 
-pub struct UpdatableDescriptor<'a> {
-    descriptor: DescriptorEnum<'a>,
+pub struct UpdatableDescriptor<'a, A: PagingAttributes = Stage1Attributes> {
+    descriptor: DescriptorEnum<'a, A>,
     level: usize,
     updated: bool,
 }
 
-impl<'a> UpdatableDescriptor<'a> {
+impl<'a, A: PagingAttributes> UpdatableDescriptor<'a, A> {
     /// Creates a new wrapper around a real descriptor that may or may not be live
-    pub(crate) fn new(desc: &'a mut Descriptor, level: usize, live: bool) -> Self {
+    pub(crate) fn new(desc: &'a mut Descriptor<A>, level: usize, live: bool) -> Self {
         Self {
             descriptor: if live {
                 DescriptorEnum::Active(desc)
             } else {
                 DescriptorEnum::Inactive(desc)
             },
-            level: level,
+            level,
             updated: false,
         }
     }
 
     /// Creates a new wrapper around an ActiveClone descriptor, which is used to observe the
     /// effect of user provided updater functions without applying them to actual descriptors
-    pub(crate) fn clone_from(d: &Descriptor, level: usize) -> Self {
+    pub(crate) fn clone_from(d: &Descriptor<A>, level: usize) -> Self {
         Self {
-            descriptor: DescriptorEnum::ActiveClone(d.bits()),
-            level: level,
+            descriptor: DescriptorEnum::ActiveClone(d.bits(), PhantomData),
+            level,
             updated: false,
         }
     }
@@ -299,29 +461,29 @@ impl<'a> UpdatableDescriptor<'a> {
     /// Returns whether this descriptor represents a table mapping. In this case, the output address
     /// refers to a next level table.
     pub fn is_table(&self) -> bool {
-        self.level < 3 && self.flags().contains(Attributes::TABLE_OR_PAGE)
+        self.level < 3 && self.flags().contains(A::TABLE_OR_PAGE)
     }
 
     /// Returns the bit representation of the underlying descriptor
     pub fn bits(&self) -> DescriptorBits {
         match &self.descriptor {
             DescriptorEnum::Active(d) | DescriptorEnum::Inactive(d) => d.bits(),
-            DescriptorEnum::ActiveClone(d) => *d,
+            DescriptorEnum::ActiveClone(d, _) => *d,
         }
     }
 
     /// Assigns the underlying descriptor according to `pa` and `flags, provided that doing so is
     /// permitted under BBM rules
-    pub fn set(&mut self, pa: PhysicalAddress, flags: Attributes) -> Result<(), ()> {
+    pub fn set(&mut self, pa: PhysicalAddress, flags: A) -> Result<(), ()> {
         if !self.bbm_permits_update(pa, flags) {
             return Err(());
         }
-        let val = (pa.0 & Descriptor::PHYSICAL_ADDRESS_BITMASK) | flags.bits();
+        let val = (pa.0 & Descriptor::<A>::PHYSICAL_ADDRESS_BITMASK) | flags.bits();
         match &mut self.descriptor {
             DescriptorEnum::Active(d) | DescriptorEnum::Inactive(d) => {
                 self.updated |= val != d.0.swap(val, Ordering::Release)
             }
-            DescriptorEnum::ActiveClone(d) => {
+            DescriptorEnum::ActiveClone(d, _) => {
                 self.updated |= *d != val;
                 *d = val
             }
@@ -334,12 +496,12 @@ impl<'a> UpdatableDescriptor<'a> {
     /// Depending on the flags this could be the address of a subtable, a mapping, or (if it is not
     /// a valid mapping) entirely arbitrary.
     pub fn output_address(&self) -> PhysicalAddress {
-        Descriptor::output_address_from_bits(self.bits())
+        Descriptor::<A>::output_address_from_bits(self.bits())
     }
 
     /// Returns the flags of this descriptor
-    pub fn flags(&self) -> Attributes {
-        Descriptor::flags_from_bits(self.bits())
+    pub fn flags(&self) -> A {
+        Descriptor::<A>::flags_from_bits(self.bits())
     }
 
     /// Returns whether this descriptor should be considered live and valid, in which case BBM
@@ -348,13 +510,13 @@ impl<'a> UpdatableDescriptor<'a> {
     fn is_live_and_valid(&self) -> bool {
         match &self.descriptor {
             DescriptorEnum::Inactive(_) => false,
-            _ => self.flags().contains(Attributes::VALID),
+            _ => self.flags().contains(A::VALID),
         }
     }
 
     /// Returns whether BBM permits setting the flags on this descriptor to `flags`
-    fn bbm_permits_update(&self, pa: PhysicalAddress, flags: Attributes) -> bool {
-        if !self.is_live_and_valid() || !flags.contains(Attributes::VALID) {
+    fn bbm_permits_update(&self, pa: PhysicalAddress, flags: A) -> bool {
+        if !self.is_live_and_valid() || !flags.contains(A::VALID) {
             return true;
         }
 
@@ -363,29 +525,15 @@ impl<'a> UpdatableDescriptor<'a> {
             return false;
         }
 
-        // Masks of bits that may be set resp. cleared on a live, valid mapping without BBM
-        let clear_allowed_mask = Attributes::VALID
-            | Attributes::READ_ONLY
-            | Attributes::ACCESSED
-            | Attributes::DBM
-            | Attributes::PXN
-            | Attributes::UXN
-            | Attributes::SWFLAG_0
-            | Attributes::SWFLAG_1
-            | Attributes::SWFLAG_2
-            | Attributes::SWFLAG_3;
-        let set_allowed_mask = clear_allowed_mask | Attributes::NON_GLOBAL;
-
-        (!self.flags() & flags & !set_allowed_mask).is_empty()
-            && (self.flags() & !flags & !clear_allowed_mask).is_empty()
+        A::is_bbm_safe(self.flags(), flags)
     }
 
     /// Modifies the descriptor by setting or clearing its flags.
-    pub fn modify_flags(&mut self, set: Attributes, clear: Attributes) -> Result<(), ()> {
+    pub fn modify_flags(&mut self, set: A, clear: A) -> Result<(), ()> {
         let oldval = self.flags();
         let flags = (oldval | set) & !clear;
 
-        if (oldval ^ flags).contains(Attributes::TABLE_OR_PAGE) {
+        if (oldval ^ flags).contains(A::TABLE_OR_PAGE) {
             // Cannot convert between table and block/page descriptors, regardless of whether or
             // not BBM permits this and whether the entry is live, given that doing so would
             // corrupt our data strucutures.

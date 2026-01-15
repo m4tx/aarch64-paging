@@ -8,25 +8,37 @@
 
 use crate::{
     MapError, Mapping,
-    descriptor::{Attributes, Descriptor, PhysicalAddress, UpdatableDescriptor, VirtualAddress},
+    descriptor::{
+        Descriptor, PagingAttributes, PhysicalAddress, Stage1Attributes, UpdatableDescriptor,
+        VirtualAddress,
+    },
     paging::{
         Constraints, MemoryRegion, PageTable, Translation, TranslationRegime, VaRange, deallocate,
     },
 };
+use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 /// Identity mapping, where every virtual address is either unmapped or mapped to the identical IPA.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct IdTranslation;
+pub struct IdTranslation<A: PagingAttributes = Stage1Attributes> {
+    _phantom: PhantomData<A>,
+}
 
-impl IdTranslation {
+impl<A: PagingAttributes> IdTranslation<A> {
+    pub fn new() -> Self {
+        Self {
+            _phantom: PhantomData,
+        }
+    }
+
     fn virtual_to_physical(va: VirtualAddress) -> PhysicalAddress {
         PhysicalAddress(va.0)
     }
 }
 
-impl Translation for IdTranslation {
-    fn allocate_table(&mut self) -> (NonNull<PageTable>, PhysicalAddress) {
+impl<A: PagingAttributes> Translation<A> for IdTranslation<A> {
+    fn allocate_table(&mut self) -> (NonNull<PageTable<A>>, PhysicalAddress) {
         let table = PageTable::new();
 
         // Physical address is the same as the virtual address because we are using identity mapping
@@ -34,7 +46,7 @@ impl Translation for IdTranslation {
         (table, PhysicalAddress(table.as_ptr() as usize))
     }
 
-    unsafe fn deallocate_table(&mut self, page_table: NonNull<PageTable>) {
+    unsafe fn deallocate_table(&mut self, page_table: NonNull<PageTable<A>>) {
         // SAFETY: Our caller promises that the memory was allocated by `allocate_table` on this
         // `IdTranslation` and not yet deallocated. `allocate_table` used the global allocator and
         // appropriate layout by calling `PageTable::new()`.
@@ -43,8 +55,8 @@ impl Translation for IdTranslation {
         }
     }
 
-    fn physical_to_virtual(&self, pa: PhysicalAddress) -> NonNull<PageTable> {
-        NonNull::new(pa.0 as *mut PageTable).expect("Got physical address 0 for pagetable")
+    fn physical_to_virtual(&self, pa: PhysicalAddress) -> NonNull<PageTable<A>> {
+        NonNull::new(pa.0 as *mut PageTable<A>).expect("Got physical address 0 for pagetable")
     }
 }
 
@@ -65,20 +77,20 @@ impl Translation for IdTranslation {
 /// ```no_run
 /// use aarch64_paging::{
 ///     idmap::IdMap,
-///     descriptor::Attributes,
+///     descriptor::Stage1Attributes,
 ///     paging::{MemoryRegion, TranslationRegime},
 /// };
 ///
 /// const ASID: usize = 1;
 /// const ROOT_LEVEL: usize = 1;
-/// const NORMAL_CACHEABLE: Attributes = Attributes::ATTRIBUTE_INDEX_1.union(Attributes::INNER_SHAREABLE);
+/// const NORMAL_CACHEABLE: Stage1Attributes = Stage1Attributes::ATTRIBUTE_INDEX_1.union(Stage1Attributes::INNER_SHAREABLE);
 ///
 /// // Create a new EL1 page table with identity mapping.
 /// let mut idmap = IdMap::new(ASID, ROOT_LEVEL, TranslationRegime::El1And0);
 /// // Map a 2 MiB region of memory as read-write.
 /// idmap.map_range(
 ///     &MemoryRegion::new(0x80200000, 0x80400000),
-///     NORMAL_CACHEABLE | Attributes::NON_GLOBAL | Attributes::VALID | Attributes::ACCESSED,
+///     NORMAL_CACHEABLE | Stage1Attributes::NON_GLOBAL | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
 /// ).unwrap();
 /// // SAFETY: Everything the program uses is within the 2 MiB region mapped above.
 /// let ttbr = unsafe {
@@ -97,8 +109,8 @@ impl Translation for IdTranslation {
 /// // Now change the mapping to read-only and executable.
 /// idmap.map_range(
 ///     &MemoryRegion::new(0x80200000, 0x80400000),
-///     NORMAL_CACHEABLE | Attributes::NON_GLOBAL | Attributes::READ_ONLY | Attributes::VALID
-///     | Attributes::ACCESSED,
+///     NORMAL_CACHEABLE | Stage1Attributes::NON_GLOBAL | Stage1Attributes::READ_ONLY | Stage1Attributes::VALID
+///     | Stage1Attributes::ACCESSED,
 /// ).unwrap();
 /// // SAFETY: Everything the program will used is mapped in by this page table.
 /// unsafe {
@@ -106,16 +118,16 @@ impl Translation for IdTranslation {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct IdMap {
-    mapping: Mapping<IdTranslation>,
+pub struct IdMap<A: PagingAttributes = Stage1Attributes> {
+    mapping: Mapping<IdTranslation<A>, A>,
 }
 
-impl IdMap {
+impl<A: PagingAttributes> IdMap<A> {
     /// Creates a new identity-mapping page table with the given ASID and root level.
     pub fn new(asid: usize, rootlevel: usize, translation_regime: TranslationRegime) -> Self {
         Self {
             mapping: Mapping::new(
-                IdTranslation,
+                IdTranslation::<A>::new(),
                 asid,
                 rootlevel,
                 translation_regime,
@@ -173,7 +185,7 @@ impl IdMap {
     /// change that may require break-before-make per the architecture must be made while the page
     /// table is inactive. Mapping a previously unmapped memory range may be done while the page
     /// table is active. This function writes block and page entries, but only maps them if `flags`
-    /// contains `Attributes::VALID`, otherwise the entries remain invalid.
+    /// contains [`PagingAttributes::VALID`], otherwise the entries remain invalid.
     ///
     /// # Errors
     ///
@@ -186,7 +198,7 @@ impl IdMap {
     ///
     /// Returns [`MapError::BreakBeforeMakeViolation`] if the range intersects with live mappings,
     /// and modifying those would violate architectural break-before-make (BBM) requirements.
-    pub fn map_range(&mut self, range: &MemoryRegion, flags: Attributes) -> Result<(), MapError> {
+    pub fn map_range(&mut self, range: &MemoryRegion, flags: A) -> Result<(), MapError> {
         self.map_range_with_constraints(range, flags, Constraints::empty())
     }
 
@@ -197,7 +209,7 @@ impl IdMap {
     /// change that may require break-before-make per the architecture must be made while the page
     /// table is inactive. Mapping a previously unmapped memory range may be done while the page
     /// table is active. This function writes block and page entries, but only maps them if `flags`
-    /// contains `Attributes::VALID`, otherwise the entries remain invalid.
+    /// contains [`PagingAttributes::VALID`], otherwise the entries remain invalid.
     ///
     /// # Errors
     ///
@@ -213,10 +225,10 @@ impl IdMap {
     pub fn map_range_with_constraints(
         &mut self,
         range: &MemoryRegion,
-        flags: Attributes,
+        flags: A,
         constraints: Constraints,
     ) -> Result<(), MapError> {
-        let pa = IdTranslation::virtual_to_physical(range.start());
+        let pa = IdTranslation::<A>::virtual_to_physical(range.start());
         self.mapping.map_range(range, pa, flags, constraints)
     }
 
@@ -259,7 +271,7 @@ impl IdMap {
     /// and modifying those would violate architectural break-before-make (BBM) requirements.
     pub fn modify_range<F>(&mut self, range: &MemoryRegion, f: &F) -> Result<(), MapError>
     where
-        F: Fn(&MemoryRegion, &mut UpdatableDescriptor) -> Result<(), ()> + ?Sized,
+        F: Fn(&MemoryRegion, &mut UpdatableDescriptor<'_, A>) -> Result<(), ()> + ?Sized,
     {
         self.mapping.modify_range(range, f)
     }
@@ -289,7 +301,7 @@ impl IdMap {
     /// largest virtual address covered by the page table given its root level.
     pub fn walk_range<F>(&self, range: &MemoryRegion, f: &mut F) -> Result<(), MapError>
     where
-        F: FnMut(&MemoryRegion, &Descriptor, usize) -> Result<(), ()>,
+        F: FnMut(&MemoryRegion, &Descriptor<A>, usize) -> Result<(), ()>,
     {
         self.mapping.walk_range(range, f)
     }
@@ -341,14 +353,13 @@ mod tests {
     use super::*;
     use crate::{
         MapError, VirtualAddress,
-        descriptor::Attributes,
         paging::{BITS_PER_LEVEL, MemoryRegion, PAGE_SIZE},
     };
 
     const MAX_ADDRESS_FOR_ROOT_LEVEL_1: usize = 1 << 39;
-    const DEVICE_NGNRE: Attributes = Attributes::ATTRIBUTE_INDEX_0;
-    const NORMAL_CACHEABLE: Attributes =
-        Attributes::ATTRIBUTE_INDEX_1.union(Attributes::INNER_SHAREABLE);
+    const DEVICE_NGNRE: Stage1Attributes = Stage1Attributes::ATTRIBUTE_INDEX_0;
+    const NORMAL_CACHEABLE: Stage1Attributes =
+        Stage1Attributes::ATTRIBUTE_INDEX_1.union(Stage1Attributes::INNER_SHAREABLE);
 
     #[test]
     fn map_valid() {
@@ -360,7 +371,7 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(0, 1),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED
             ),
             Ok(())
         );
@@ -377,7 +388,7 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(0, PAGE_SIZE * 2),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED
             ),
             Ok(())
         );
@@ -397,7 +408,7 @@ mod tests {
                     MAX_ADDRESS_FOR_ROOT_LEVEL_1 - 1,
                     MAX_ADDRESS_FOR_ROOT_LEVEL_1
                 ),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED
             ),
             Ok(())
         );
@@ -414,7 +425,7 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(PAGE_SIZE * 1023, PAGE_SIZE * 1025),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED
             ),
             Ok(())
         );
@@ -431,7 +442,7 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(0, MAX_ADDRESS_FOR_ROOT_LEVEL_1),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED
             ),
             Ok(())
         );
@@ -448,7 +459,7 @@ mod tests {
         idmap
             .map_range_with_constraints(
                 &MemoryRegion::new(BLOCK_SIZE, 2 * BLOCK_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
                 Constraints::NO_BLOCK_MAPPINGS,
             )
             .unwrap();
@@ -460,7 +471,7 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(BLOCK_SIZE, BLOCK_SIZE + PAGE_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
             ),
             Ok(())
         );
@@ -472,7 +483,7 @@ mod tests {
         idmap
             .map_range(
                 &MemoryRegion::new(BLOCK_SIZE, 2 * BLOCK_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
             )
             .ok();
         // SAFETY: This doesn't actually activate the page table in tests, it just treats it as
@@ -484,7 +495,7 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(BLOCK_SIZE - PAGE_SIZE, 2 * BLOCK_SIZE + PAGE_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
             ),
             Ok(())
         );
@@ -494,7 +505,7 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(BLOCK_SIZE, BLOCK_SIZE + PAGE_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
             ),
             Ok(())
         );
@@ -503,7 +514,10 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(BLOCK_SIZE, BLOCK_SIZE + PAGE_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED | Attributes::READ_ONLY,
+                NORMAL_CACHEABLE
+                    | Stage1Attributes::VALID
+                    | Stage1Attributes::ACCESSED
+                    | Stage1Attributes::READ_ONLY,
             ),
             Err(MapError::BreakBeforeMakeViolation(MemoryRegion::new(
                 BLOCK_SIZE,
@@ -516,7 +530,10 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(0, BLOCK_SIZE + PAGE_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED | Attributes::READ_ONLY,
+                NORMAL_CACHEABLE
+                    | Stage1Attributes::VALID
+                    | Stage1Attributes::ACCESSED
+                    | Stage1Attributes::READ_ONLY,
             ),
             Err(MapError::BreakBeforeMakeViolation(MemoryRegion::new(
                 BLOCK_SIZE,
@@ -526,7 +543,10 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(0, BLOCK_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED | Attributes::READ_ONLY,
+                NORMAL_CACHEABLE
+                    | Stage1Attributes::VALID
+                    | Stage1Attributes::ACCESSED
+                    | Stage1Attributes::READ_ONLY,
             ),
             Ok(())
         );
@@ -535,7 +555,10 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(0, BLOCK_SIZE),
-                DEVICE_NGNRE | Attributes::VALID | Attributes::ACCESSED | Attributes::NON_GLOBAL,
+                DEVICE_NGNRE
+                    | Stage1Attributes::VALID
+                    | Stage1Attributes::ACCESSED
+                    | Stage1Attributes::NON_GLOBAL,
             ),
             Err(MapError::BreakBeforeMakeViolation(MemoryRegion::new(
                 0, PAGE_SIZE
@@ -562,7 +585,7 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(0, 2 * PAGE_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
             ),
             Ok(())
         );
@@ -572,9 +595,9 @@ mod tests {
             idmap.map_range(
                 &MemoryRegion::new(0, PAGE_SIZE),
                 NORMAL_CACHEABLE
-                    | Attributes::VALID
-                    | Attributes::ACCESSED
-                    | Attributes::NON_GLOBAL,
+                    | Stage1Attributes::VALID
+                    | Stage1Attributes::ACCESSED
+                    | Stage1Attributes::NON_GLOBAL,
             ),
             Ok(())
         );
@@ -583,7 +606,7 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(0, PAGE_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
             ),
             Err(MapError::BreakBeforeMakeViolation(MemoryRegion::new(
                 0, PAGE_SIZE
@@ -599,7 +622,7 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(0, PAGE_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
             ),
             Ok(())
         );
@@ -616,7 +639,7 @@ mod tests {
                     MAX_ADDRESS_FOR_ROOT_LEVEL_1,
                     MAX_ADDRESS_FOR_ROOT_LEVEL_1 + 1,
                 ),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED
             ),
             Err(MapError::AddressRange(VirtualAddress(
                 MAX_ADDRESS_FOR_ROOT_LEVEL_1 + PAGE_SIZE
@@ -627,7 +650,7 @@ mod tests {
         assert_eq!(
             idmap.map_range(
                 &MemoryRegion::new(0, MAX_ADDRESS_FOR_ROOT_LEVEL_1 + 1),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED
             ),
             Err(MapError::AddressRange(VirtualAddress(
                 MAX_ADDRESS_FOR_ROOT_LEVEL_1 + PAGE_SIZE
@@ -643,10 +666,10 @@ mod tests {
             .map_range(
                 &MemoryRegion::new(0, PAGE_SIZE << BITS_PER_LEVEL),
                 NORMAL_CACHEABLE
-                    | Attributes::NON_GLOBAL
-                    | Attributes::READ_ONLY
-                    | Attributes::VALID
-                    | Attributes::ACCESSED,
+                    | Stage1Attributes::NON_GLOBAL
+                    | Stage1Attributes::READ_ONLY
+                    | Stage1Attributes::VALID
+                    | Stage1Attributes::ACCESSED,
             )
             .unwrap();
         // SAFETY: This doesn't actually activate the page table in tests, it just treats it as
@@ -656,15 +679,18 @@ mod tests {
             .map_range(
                 &MemoryRegion::new(0, PAGE_SIZE),
                 NORMAL_CACHEABLE
-                    | Attributes::NON_GLOBAL
-                    | Attributes::READ_ONLY
-                    | Attributes::VALID
-                    | Attributes::ACCESSED,
+                    | Stage1Attributes::NON_GLOBAL
+                    | Stage1Attributes::READ_ONLY
+                    | Stage1Attributes::VALID
+                    | Stage1Attributes::ACCESSED,
             )
             .unwrap();
         let r = idmap.map_range(
             &MemoryRegion::new(PAGE_SIZE, 2 * PAGE_SIZE),
-            NORMAL_CACHEABLE | Attributes::NON_GLOBAL | Attributes::VALID | Attributes::ACCESSED,
+            NORMAL_CACHEABLE
+                | Stage1Attributes::NON_GLOBAL
+                | Stage1Attributes::VALID
+                | Stage1Attributes::ACCESSED,
         );
         unsafe { idmap.deactivate(ttbr) };
         r.unwrap();
@@ -676,10 +702,10 @@ mod tests {
             .map_range(
                 &MemoryRegion::new(0, PAGE_SIZE * 2),
                 NORMAL_CACHEABLE
-                    | Attributes::NON_GLOBAL
-                    | Attributes::READ_ONLY
-                    | Attributes::VALID
-                    | Attributes::ACCESSED,
+                    | Stage1Attributes::NON_GLOBAL
+                    | Stage1Attributes::READ_ONLY
+                    | Stage1Attributes::VALID
+                    | Stage1Attributes::ACCESSED,
             )
             .unwrap();
         // SAFETY: This doesn't actually activate the page table in tests, it just treats it as
@@ -694,7 +720,10 @@ mod tests {
         assert!(
             idmap
                 .modify_range(&MemoryRegion::new(PAGE_SIZE * 2, 1), &|_range, entry| {
-                    entry.modify_flags(Attributes::SWFLAG_0, Attributes::from_bits(0usize).unwrap())
+                    entry.modify_flags(
+                        Stage1Attributes::SWFLAG_0,
+                        Stage1Attributes::from_bits(0usize).unwrap(),
+                    )
                 },)
                 .is_err()
         );
@@ -711,7 +740,10 @@ mod tests {
             idmap
                 .modify_range(&MemoryRegion::new(1, PAGE_SIZE), &|_range, entry| {
                     if !entry.is_table() {
-                        entry.modify_flags(Attributes::SWFLAG_0, Attributes::NON_GLOBAL)?;
+                        entry.modify_flags(
+                            Stage1Attributes::SWFLAG_0,
+                            Stage1Attributes::NON_GLOBAL,
+                        )?;
                     }
                     Ok(())
                 })
@@ -721,8 +753,8 @@ mod tests {
             .modify_range(&MemoryRegion::new(1, PAGE_SIZE), &|_range, entry| {
                 if !entry.is_table() {
                     entry.modify_flags(
-                        Attributes::SWFLAG_0,
-                        Attributes::from_bits(0usize).unwrap(),
+                        Stage1Attributes::SWFLAG_0,
+                        Stage1Attributes::from_bits(0usize).unwrap(),
                     )?;
                 }
                 Ok(())
@@ -731,7 +763,7 @@ mod tests {
         idmap
             .modify_range(&MemoryRegion::new(1, PAGE_SIZE), &|range, entry| {
                 if !entry.is_table() {
-                    assert!(entry.flags().contains(Attributes::SWFLAG_0));
+                    assert!(entry.flags().contains(Stage1Attributes::SWFLAG_0));
                     assert_eq!(range.end() - range.start(), PAGE_SIZE);
                 }
                 Ok(())
@@ -752,22 +784,22 @@ mod tests {
         idmap
             .map_range(
                 &MemoryRegion::new(0, BLOCK_RANGE),
-                NORMAL_CACHEABLE | Attributes::NON_GLOBAL | Attributes::SWFLAG_0,
+                NORMAL_CACHEABLE | Stage1Attributes::NON_GLOBAL | Stage1Attributes::SWFLAG_0,
             )
             .unwrap();
         idmap
             .map_range(
                 &MemoryRegion::new(0, PAGE_SIZE),
                 NORMAL_CACHEABLE
-                    | Attributes::NON_GLOBAL
-                    | Attributes::VALID
-                    | Attributes::ACCESSED,
+                    | Stage1Attributes::NON_GLOBAL
+                    | Stage1Attributes::VALID
+                    | Stage1Attributes::ACCESSED,
             )
             .unwrap();
         idmap
             .modify_range(&MemoryRegion::new(0, BLOCK_RANGE), &|range, entry| {
                 if entry.level() == 3 {
-                    let has_swflag = entry.flags().contains(Attributes::SWFLAG_0);
+                    let has_swflag = entry.flags().contains(Stage1Attributes::SWFLAG_0);
                     let is_first_page = range.start().0 == 0usize;
                     assert!(has_swflag != is_first_page);
                 }
@@ -792,14 +824,14 @@ mod tests {
         idmap
             .map_range(
                 &MemoryRegion::new(0, PAGE_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
             )
             .unwrap();
         // Unmap the whole table's worth of address space.
         idmap
             .map_range(
                 &MemoryRegion::new(0, PAGE_SIZE * 512 * 512),
-                Attributes::empty(),
+                Stage1Attributes::empty(),
             )
             .unwrap();
         // All entries in the top-level table should be 0.
@@ -833,14 +865,14 @@ mod tests {
         idmap
             .map_range(
                 &MemoryRegion::new(ROOT_GRANULARITY, ROOT_GRANULARITY + PAGE_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
             )
             .unwrap();
         // Unmap the second entry of the root table.
         idmap
             .map_range(
                 &MemoryRegion::new(ROOT_GRANULARITY, ROOT_GRANULARITY * 2),
-                Attributes::empty(),
+                Stage1Attributes::empty(),
             )
             .unwrap();
         // All entries in the top-level table should be 0.
@@ -873,12 +905,15 @@ mod tests {
         idmap
             .map_range(
                 &MemoryRegion::new(0, PAGE_SIZE * 2),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
             )
             .unwrap();
         // Unmap the pages again.
         idmap
-            .map_range(&MemoryRegion::new(0, PAGE_SIZE * 2), Attributes::empty())
+            .map_range(
+                &MemoryRegion::new(0, PAGE_SIZE * 2),
+                Stage1Attributes::empty(),
+            )
             .unwrap();
         // Compact to remove the subtables.
         idmap.compact_subtables();
@@ -913,12 +948,15 @@ mod tests {
         idmap
             .map_range(
                 &MemoryRegion::new(0, BLOCK_SIZE * 2),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
             )
             .unwrap();
         // Unmap the blocks again.
         idmap
-            .map_range(&MemoryRegion::new(0, BLOCK_SIZE * 2), Attributes::empty())
+            .map_range(
+                &MemoryRegion::new(0, BLOCK_SIZE * 2),
+                Stage1Attributes::empty(),
+            )
             .unwrap();
         // Compact to remove the subtables.
         idmap.compact_subtables();
@@ -948,7 +986,7 @@ mod tests {
         idmap
             .map_range(
                 &MemoryRegion::new(0, PAGE_SIZE),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
             )
             .unwrap();
         idmap
@@ -957,7 +995,7 @@ mod tests {
                 &mut |_, descriptor, _| {
                     assert!(!descriptor.is_valid());
                     assert_eq!(descriptor.bits(), 0);
-                    assert_eq!(descriptor.flags(), Attributes::empty());
+                    assert_eq!(descriptor.flags(), Stage1Attributes::empty());
                     assert_eq!(descriptor.output_address(), PhysicalAddress(0));
                     Ok(())
                 },
@@ -977,14 +1015,14 @@ mod tests {
         idmap
             .map_range(
                 &MemoryRegion::new(PAGE_SIZE, PAGE_SIZE * 3),
-                NORMAL_CACHEABLE | Attributes::VALID | Attributes::ACCESSED,
+                NORMAL_CACHEABLE | Stage1Attributes::VALID | Stage1Attributes::ACCESSED,
             )
             .unwrap();
         // Use `modify_range` to unmap the pages.
         idmap
             .modify_range(
                 &MemoryRegion::new(PAGE_SIZE, PAGE_SIZE * 3),
-                &|_, descriptor| descriptor.set(PhysicalAddress(0), Attributes::empty()),
+                &|_, descriptor| descriptor.set(PhysicalAddress(0), Stage1Attributes::empty()),
             )
             .unwrap();
         // Compact to remove the subtables.
@@ -1009,9 +1047,21 @@ mod tests {
 
     #[test]
     fn table_sizes() {
-        assert_eq!(IdMap::new(1, 0, TranslationRegime::El1And0).size(), 1 << 48);
-        assert_eq!(IdMap::new(1, 1, TranslationRegime::El1And0).size(), 1 << 39);
-        assert_eq!(IdMap::new(1, 2, TranslationRegime::El1And0).size(), 1 << 30);
-        assert_eq!(IdMap::new(1, 3, TranslationRegime::El1And0).size(), 1 << 21);
+        assert_eq!(
+            IdMap::<Stage1Attributes>::new(1, 0, TranslationRegime::El1And0).size(),
+            1 << 48
+        );
+        assert_eq!(
+            IdMap::<Stage1Attributes>::new(1, 1, TranslationRegime::El1And0).size(),
+            1 << 39
+        );
+        assert_eq!(
+            IdMap::<Stage1Attributes>::new(1, 2, TranslationRegime::El1And0).size(),
+            1 << 30
+        );
+        assert_eq!(
+            IdMap::<Stage1Attributes>::new(1, 3, TranslationRegime::El1And0).size(),
+            1 << 21
+        );
     }
 }
