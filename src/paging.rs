@@ -66,7 +66,7 @@ impl TranslationRegime {
     ///
     /// This also implies that it supports two VA ranges.
     pub(crate) fn supports_asid(self) -> bool {
-        matches!(self, Self::El2And0 | Self::El1And0)
+        matches!(self, Self::El2And0 | Self::El1And0 | Self::Stage2)
     }
 
     /// Invalidates the memory range starting at `va`. The size of the range is unspecified, it is
