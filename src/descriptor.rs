@@ -104,7 +104,7 @@ impl Sub<usize> for PhysicalAddress {
 /// This allows the same page table structure to be used for different translation regimes (e.g.
 /// Stage 1 vs Stage 2) which use different attribute bit definitions.
 pub trait PagingAttributes:
-    Sized
+    bitflags::Flags<Bits = usize>
     + Copy
     + Clone
     + Debug
@@ -119,27 +119,6 @@ pub trait PagingAttributes:
     + Sub<Output = Self>
     + Not<Output = Self>
 {
-    /// Create attributes from raw bits, preserving unknown bits.
-    fn from_bits_retain(bits: usize) -> Self;
-    /// Get the raw bits of the attributes.
-    fn bits(&self) -> usize;
-    /// Returns true if all flags in `other` are contained in `self`.
-    fn contains(&self, other: Self) -> bool {
-        (*self & other) == other
-    }
-    /// Returns the union of the two sets of flags.
-    fn union(&self, other: Self) -> Self {
-        *self | other
-    }
-    /// Returns the difference between the two sets of flags.
-    fn difference(&self, other: Self) -> Self {
-        *self - other
-    }
-    /// Returns true if the set of flags is empty.
-    fn is_empty(&self) -> bool;
-    /// Returns true if the two sets of flags intersect.
-    fn intersects(&self, other: Self) -> bool;
-
     /// The bit indicating that a mapping is valid.
     const VALID: Self;
     /// The bit indicating that a descriptor is a table or page (leaf at level 3) rather than a block.
@@ -197,19 +176,6 @@ bitflags! {
 }
 
 impl PagingAttributes for Stage1Attributes {
-    fn from_bits_retain(bits: usize) -> Self {
-        Self::from_bits_retain(bits)
-    }
-    fn bits(&self) -> usize {
-        self.bits()
-    }
-    fn is_empty(&self) -> bool {
-        self.is_empty()
-    }
-    fn intersects(&self, other: Self) -> bool {
-        self.intersects(other)
-    }
-
     const VALID: Self = Self::VALID;
     const TABLE_OR_PAGE: Self = Self::TABLE_OR_PAGE;
 
@@ -278,19 +244,6 @@ bitflags! {
 }
 
 impl PagingAttributes for Stage2Attributes {
-    fn from_bits_retain(bits: usize) -> Self {
-        Self::from_bits_retain(bits)
-    }
-    fn bits(&self) -> usize {
-        self.bits()
-    }
-    fn is_empty(&self) -> bool {
-        self.is_empty()
-    }
-    fn intersects(&self, other: Self) -> bool {
-        self.intersects(other)
-    }
-
     const VALID: Self = Self::VALID;
     const TABLE_OR_PAGE: Self = Self::TABLE_OR_PAGE;
 
