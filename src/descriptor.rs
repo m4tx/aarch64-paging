@@ -99,12 +99,21 @@ impl Sub<usize> for PhysicalAddress {
     }
 }
 
+mod private {
+    pub trait Sealed {}
+}
+
 /// Trait abstracting the attributes used in page table descriptors.
 ///
 /// This allows the same page table structure to be used for different translation regimes (e.g.
 /// Stage 1 vs Stage 2) which use different attribute bit definitions.
+///
+/// # Sealed
+///
+/// This trait is sealed, which means it cannot be implemented for types outside of aarch64-paging.
 pub trait PagingAttributes:
-    bitflags::Flags<Bits = usize>
+    private::Sealed
+    + bitflags::Flags<Bits = usize>
     + Copy
     + Clone
     + Debug
@@ -128,89 +137,111 @@ pub trait PagingAttributes:
     fn is_bbm_safe(old: Self, new: Self) -> bool;
 }
 
-bitflags! {
-    /// Attribute bits for a mapping in a Stage 1 page table.
-    #[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-    pub struct Stage1Attributes: usize {
-        const VALID         = 1 << 0;
-        const TABLE_OR_PAGE = 1 << 1;
+macro_rules! define_stage1_attributes {
+    ($name:ident, uxn_name = $uxn_name:ident, exclude_user = $exclude_user:literal, exclude_pxn = $exclude_pxn:literal) => {
+        bitflags! {
+            /// Attribute bits for a mapping in a Stage 1 page table.
+            #[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+            pub struct $name: usize {
+                const VALID         = 1 << 0;
+                const TABLE_OR_PAGE = 1 << 1;
 
-        const ATTRIBUTE_INDEX_0 = 0 << 2;
-        const ATTRIBUTE_INDEX_1 = 1 << 2;
-        const ATTRIBUTE_INDEX_2 = 2 << 2;
-        const ATTRIBUTE_INDEX_3 = 3 << 2;
-        const ATTRIBUTE_INDEX_4 = 4 << 2;
-        const ATTRIBUTE_INDEX_5 = 5 << 2;
-        const ATTRIBUTE_INDEX_6 = 6 << 2;
-        const ATTRIBUTE_INDEX_7 = 7 << 2;
+                const ATTRIBUTE_INDEX_0 = 0 << 2;
+                const ATTRIBUTE_INDEX_1 = 1 << 2;
+                const ATTRIBUTE_INDEX_2 = 2 << 2;
+                const ATTRIBUTE_INDEX_3 = 3 << 2;
+                const ATTRIBUTE_INDEX_4 = 4 << 2;
+                const ATTRIBUTE_INDEX_5 = 5 << 2;
+                const ATTRIBUTE_INDEX_6 = 6 << 2;
+                const ATTRIBUTE_INDEX_7 = 7 << 2;
 
-        const OUTER_SHAREABLE = 2 << 8;
-        const INNER_SHAREABLE = 3 << 8;
+                const OUTER_SHAREABLE = 2 << 8;
+                const INNER_SHAREABLE = 3 << 8;
 
-        const NS            = 1 << 5;
-        const USER          = 1 << 6;
-        const READ_ONLY     = 1 << 7;
-        const ACCESSED      = 1 << 10;
-        const NON_GLOBAL    = 1 << 11;
-        /// Guarded Page - indirect forward edge jumps expect an appropriate BTI landing pad.
-        const GP            = 1 << 50;
-        const DBM           = 1 << 51;
-        /// Privileged Execute-never, if two privilege levels are supported.
-        const PXN           = 1 << 53;
-        /// Unprivileged Execute-never, or just Execute-never if only one privilege level is
-        /// supported.
-        const UXN           = 1 << 54;
+                const NS            = 1 << 5;
+                const USER          = (1 & !$exclude_user) << 6;
+                const READ_ONLY     = 1 << 7;
+                const ACCESSED      = 1 << 10;
+                const NON_GLOBAL    = 1 << 11;
+                /// Guarded Page - indirect forward edge jumps expect an appropriate BTI landing pad.
+                const GP            = 1 << 50;
+                const DBM           = 1 << 51;
+                /// Privileged Execute-never, if two privilege levels are supported.
+                const PXN           = (1 & !$exclude_pxn) << 53;
+                /// Unprivileged Execute-never, or just Execute-never if only one privilege level is
+                /// supported.
+                const $uxn_name     = 1 << 54;
 
-        // Software flags in block and page descriptor entries.
-        const SWFLAG_0 = 1 << 55;
-        const SWFLAG_1 = 1 << 56;
-        const SWFLAG_2 = 1 << 57;
-        const SWFLAG_3 = 1 << 58;
+                // Software flags in block and page descriptor entries.
+                const SWFLAG_0 = 1 << 55;
+                const SWFLAG_1 = 1 << 56;
+                const SWFLAG_2 = 1 << 57;
+                const SWFLAG_3 = 1 << 58;
 
-        const PXN_TABLE = 1 << 59;
-        const XN_TABLE = 1 << 60;
-        const AP_TABLE_NO_EL0 = 1 << 61;
-        const AP_TABLE_NO_WRITE = 1 << 62;
-        const NS_TABLE = 1 << 63;
-    }
-}
-
-impl PagingAttributes for Stage1Attributes {
-    const VALID: Self = Self::VALID;
-    const TABLE_OR_PAGE: Self = Self::TABLE_OR_PAGE;
-
-    fn is_bbm_safe(old: Self, new: Self) -> bool {
-        if !old.contains(Self::VALID) || !new.contains(Self::VALID) {
-            return true;
+                const PXN_TABLE = 1 << 59;
+                const XN_TABLE = 1 << 60;
+                const AP_TABLE_NO_EL0 = 1 << 61;
+                const AP_TABLE_NO_WRITE = 1 << 62;
+                const NS_TABLE = 1 << 63;
+            }
         }
 
-        // Masks of bits that may be set resp. cleared on a live, valid mapping without BBM
-        let clear_allowed_mask = Self::VALID
-            | Self::READ_ONLY
-            | Self::ACCESSED
-            | Self::DBM
-            | Self::PXN
-            | Self::UXN
-            | Self::SWFLAG_0
-            | Self::SWFLAG_1
-            | Self::SWFLAG_2
-            | Self::SWFLAG_3;
-        let set_allowed_mask = clear_allowed_mask | Self::NON_GLOBAL;
+        impl private::Sealed for $name {}
+        impl PagingAttributes for $name {
+            const VALID: Self = Self::VALID;
+            const TABLE_OR_PAGE: Self = Self::TABLE_OR_PAGE;
 
-        (!old & new & !set_allowed_mask).is_empty() && (old & !new & !clear_allowed_mask).is_empty()
-    }
+            fn is_bbm_safe(old: Self, new: Self) -> bool {
+                if !old.contains(Self::VALID) || !new.contains(Self::VALID) {
+                    return true;
+                }
+
+                // Masks of bits that may be set resp. cleared on a live, valid mapping without BBM
+                let clear_allowed_mask = Self::VALID
+                    | Self::READ_ONLY
+                    | Self::ACCESSED
+                    | Self::DBM
+                    | Self::PXN
+                    | Self::$uxn_name
+                    | Self::SWFLAG_0
+                    | Self::SWFLAG_1
+                    | Self::SWFLAG_2
+                    | Self::SWFLAG_3;
+                let set_allowed_mask = clear_allowed_mask | Self::NON_GLOBAL;
+
+                (!old & new & !set_allowed_mask).is_empty()
+                    && (old & !new & !clear_allowed_mask).is_empty()
+            }
+        }
+
+        impl $name {
+            /// Mask for the bits determining the shareability of the mapping.
+            pub const SHAREABILITY_MASK: Self = Self::INNER_SHAREABLE;
+
+            /// Mask for the bits determining the attribute index of the mapping.
+            pub const ATTRIBUTE_INDEX_MASK: Self = Self::ATTRIBUTE_INDEX_7;
+        }
+    };
 }
 
-#[deprecated(note = "use `Stage1Attributes` directly instead")]
-pub type Attributes = Stage1Attributes;
-
-impl Stage1Attributes {
-    /// Mask for the bits determining the shareability of the mapping.
-    pub const SHAREABILITY_MASK: Self = Self::INNER_SHAREABLE;
-
-    /// Mask for the bits determining the attribute index of the mapping.
-    pub const ATTRIBUTE_INDEX_MASK: Self = Self::ATTRIBUTE_INDEX_7;
-}
+define_stage1_attributes!(
+    El1Attributes,
+    uxn_name = UXN,
+    exclude_user = 0,
+    exclude_pxn = 0
+);
+define_stage1_attributes!(
+    El2Attributes,
+    uxn_name = XN,
+    exclude_user = 1,
+    exclude_pxn = 1
+);
+define_stage1_attributes!(
+    El3Attributes,
+    uxn_name = XN,
+    exclude_user = 1,
+    exclude_pxn = 1
+);
 
 bitflags! {
     /// Attribute bits for a mapping in a Stage 2 page table.
@@ -243,6 +274,7 @@ bitflags! {
     }
 }
 
+impl private::Sealed for Stage2Attributes {}
 impl PagingAttributes for Stage2Attributes {
     const VALID: Self = Self::VALID;
     const TABLE_OR_PAGE: Self = Self::TABLE_OR_PAGE;
@@ -272,10 +304,7 @@ pub(crate) type DescriptorBits = usize;
 ///   - A block mapping, if it is not in the lowest level page table.
 ///   - A pointer to a lower level pagetable, if it is not in the lowest level page table.
 #[repr(C)]
-pub struct Descriptor<A: PagingAttributes = Stage1Attributes>(
-    pub(crate) AtomicUsize,
-    PhantomData<A>,
-);
+pub struct Descriptor<A: PagingAttributes = El1Attributes>(pub(crate) AtomicUsize, PhantomData<A>);
 
 impl<A: PagingAttributes> Descriptor<A> {
     /// An empty (i.e. 0) descriptor.
@@ -371,7 +400,7 @@ enum DescriptorEnum<'a, A: PagingAttributes> {
     ActiveClone(DescriptorBits, PhantomData<A>),
 }
 
-pub struct UpdatableDescriptor<'a, A: PagingAttributes = Stage1Attributes> {
+pub struct UpdatableDescriptor<'a, A: PagingAttributes = El1Attributes> {
     descriptor: DescriptorEnum<'a, A>,
     level: usize,
     updated: bool,

@@ -18,8 +18,8 @@ use core::{mem::size_of, ptr::NonNull};
 ///
 /// ```
 /// use aarch64_paging::{
-///     descriptor::{PhysicalAddress, Stage1Attributes},
-///     paging::{Constraints, MemoryRegion, RootTable, TranslationRegime, VaRange},
+///     descriptor::{PhysicalAddress, El1Attributes},
+///     paging::{Constraints, MemoryRegion, RootTable, El1And0, VaRange},
 ///     target::TargetAllocator,
 /// };
 ///
@@ -28,16 +28,16 @@ use core::{mem::size_of, ptr::NonNull};
 /// let mut map = RootTable::new(
 ///     TargetAllocator::new(0x1_0000),
 ///     ROOT_LEVEL,
-///     TranslationRegime::El1And0,
+///     El1And0,
 ///     VaRange::Lower,
 /// );
 /// map.map_range(
 ///     &MemoryRegion::new(0x0, 0x1000),
 ///     PhysicalAddress(0x4_2000),
-///     Stage1Attributes::VALID
-///         | Stage1Attributes::ATTRIBUTE_INDEX_0
-///         | Stage1Attributes::INNER_SHAREABLE
-///         | Stage1Attributes::UXN,
+///     El1Attributes::VALID
+///         | El1Attributes::ATTRIBUTE_INDEX_0
+///         | El1Attributes::INNER_SHAREABLE
+///         | El1Attributes::UXN,
 ///     Constraints::empty(),
 /// )
 /// .unwrap();
@@ -137,8 +137,8 @@ impl Translation for TargetAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::descriptor::Stage1Attributes;
-    use crate::paging::{Constraints, MemoryRegion, RootTable, TranslationRegime, VaRange};
+    use crate::descriptor::El1Attributes;
+    use crate::paging::{Constraints, El1And0, MemoryRegion, RootTable, VaRange};
 
     const ROOT_LEVEL: usize = 1;
 
@@ -147,16 +147,16 @@ mod tests {
         let mut map = RootTable::new(
             TargetAllocator::new(0x1_0000),
             ROOT_LEVEL,
-            TranslationRegime::El1And0,
+            El1And0,
             VaRange::Lower,
         );
         map.map_range(
             &MemoryRegion::new(0x0, 0x1000),
             PhysicalAddress(0x4_2000),
-            Stage1Attributes::VALID
-                | Stage1Attributes::ATTRIBUTE_INDEX_0
-                | Stage1Attributes::INNER_SHAREABLE
-                | Stage1Attributes::UXN,
+            El1Attributes::VALID
+                | El1Attributes::ATTRIBUTE_INDEX_0
+                | El1Attributes::INNER_SHAREABLE
+                | El1Attributes::UXN,
             Constraints::empty(),
         )
         .unwrap();
